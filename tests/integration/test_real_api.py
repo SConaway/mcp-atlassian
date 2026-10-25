@@ -661,15 +661,36 @@ class TestRealConfluenceScopeFilters(BaseAuthTest):
             if space2:
                 make("X", space2)
 
-            # Wait for the index to see every page before any filtered query,
-            # so exclusion assertions below are not satisfied by index lag.
-            cql = f'title ~ "{marker}"'
-            found = _retry_until(
-                lambda: {p.id for p in fetcher.search(cql, limit=50)},
-                lambda got: set(ids.values()) <= got,
-                tries=30,
-            )
-            if not set(ids.values()) <= found:
+            # Wait for the index to settle on every field the filters use. Atlassian
+            # indexes title, space, id and ancestor at different times, so waiting
+            # on a title search alone leaves scoped queries in a partial state.
+            def snapshot() -> dict[str, set[str]]:
+                queries = {
+                    "title": f'title ~ "{marker}"',
+                    "space": f'title ~ "{marker}" AND space = "{space}"',
+                    "tree": (
+                        f'title ~ "{marker}" AND '
+                        f"(id = {ids['R']} OR ancestor = {ids['R']})"
+                    ),
+                    "id": f'title ~ "{marker}" AND id = {ids["A"]}',
+                }
+                return {
+                    k: {p.id for p in fetcher.search(q, limit=50)}
+                    for k, q in queries.items()
+                }
+
+            in_space = {ids[n] for n in ("R", "A", "A1", "B", "U")}
+            in_tree = {ids[n] for n in ("R", "A", "A1", "B")}
+
+            def settled(got: dict[str, set[str]]) -> bool:
+                return (
+                    got["title"] == set(ids.values())
+                    and got["space"] == in_space
+                    and got["tree"] == in_tree
+                    and got["id"] == {ids["A"]}
+                )
+
+            if not settled(_retry_until(snapshot, settled, tries=40, delay=3.0)):
                 pytest.skip("Search index did not catch up with the test pages")
             yield ids
         finally:
@@ -684,12 +705,14 @@ class TestRealConfluenceScopeFilters(BaseAuthTest):
         """Return search(names, cql=None, **filters) -> set of page ids."""
 
         def _search(
-            cql: str | None = None, spaces_filter: str | None = None, **filters
+            cql: str | None = None, arg_spaces: str | None = None, **filters
         ) -> set[str]:
+            """Search with config filters in ``filters``; ``arg_spaces`` is the
+            ``spaces_filter`` tool argument (narrows only)."""
             config = dataclasses.replace(base_config, **filters)
             fetcher = ConfluenceFetcher(config=config)
             query = cql or f'title ~ "{marker}"'
-            results = fetcher.search(query, limit=50, spaces_filter=spaces_filter)
+            results = fetcher.search(query, limit=50, spaces_filter=arg_spaces)
             return {p.id for p in results}
 
         return _search
@@ -737,14 +760,14 @@ class TestRealConfluenceScopeFilters(BaseAuthTest):
 
     def test_spaces_filter_arg_narrows_scope(self, tree, search, space):
         """The tool arg intersects with the configured scope, never widens it."""
-        assert search(trees_filter=tree["R"], spaces_filter=space) == self._expect(
+        assert search(trees_filter=tree["R"], arg_spaces=space) == self._expect(
             tree, "R", "A", "A1", "B"
         )
 
     def test_spaces_filter_arg_cannot_widen_to_other_space(self, tree, search, space2):
         if not space2:
             pytest.skip("CONFLUENCE_TEST_SPACE_KEY_2 not set")
-        assert search(trees_filter=tree["R"], spaces_filter=space2) == set()
+        assert search(trees_filter=tree["R"], arg_spaces=space2) == set()
 
     @pytest.mark.security_regression
     def test_caller_cql_cannot_escape_pages_scope(self, tree, search, marker):
