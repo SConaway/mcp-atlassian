@@ -6,6 +6,7 @@ These tests are skipped by default and only run with the
 configuration and will create/modify real data.
 """
 
+import dataclasses
 import os
 import time
 import uuid
@@ -585,6 +586,184 @@ class TestRealConfluenceAPI(BaseAuthTest):
             # Cleanup
             confluence_client.delete_page(page_id=page.id)
             created_pages.remove(page.id)
+
+
+@pytest.mark.integration
+class TestRealConfluenceScopeFilters(BaseAuthTest):
+    """Live checks of CONFLUENCE_{SPACES,PAGES,TREES}_FILTER against real CQL.
+
+    Builds this page tree (all titles carry a per-run marker) and deletes it
+    afterwards::
+
+        R
+        ├── A
+        │   └── A1
+        └── B
+        U            (same space as R, outside the tree)
+        X            (second space; only if CONFLUENCE_TEST_SPACE_KEY_2 is set)
+    """
+
+    @pytest.fixture(autouse=True)
+    def skip_without_real_data(self, request):
+        """Skip these tests unless --use-real-data is provided."""
+        if not request.config.getoption("--use-real-data", default=False):
+            pytest.skip("Real API tests only run with --use-real-data flag")
+
+    @pytest.fixture(scope="class")
+    def base_config(self) -> ConfluenceConfig:
+        """Real config from the environment with every scope filter cleared."""
+        if not os.getenv("CONFLUENCE_URL"):
+            pytest.skip("CONFLUENCE_URL not set in environment")
+        if not os.getenv("CONFLUENCE_TEST_SPACE_KEY"):
+            pytest.skip("CONFLUENCE_TEST_SPACE_KEY not set in environment")
+        return dataclasses.replace(
+            ConfluenceConfig.from_env(),
+            spaces_filter=None,
+            pages_filter=None,
+            trees_filter=None,
+        )
+
+    @pytest.fixture(scope="class")
+    def space(self) -> str:
+        return os.environ["CONFLUENCE_TEST_SPACE_KEY"]
+
+    @pytest.fixture(scope="class")
+    def space2(self) -> str | None:
+        return os.getenv("CONFLUENCE_TEST_SPACE_KEY_2") or None
+
+    @pytest.fixture(scope="class")
+    def marker(self) -> str:
+        return f"scopetest{uuid.uuid4().hex[:8]}"
+
+    @pytest.fixture(scope="class")
+    def tree(self, base_config, space, space2, marker):
+        """Create the page tree once for the whole class; yield name -> page id."""
+        fetcher = ConfluenceFetcher(config=base_config)
+        ids: dict[str, str] = {}
+        created: list[str] = []
+
+        def make(name: str, space_key: str, parent: str | None = None) -> None:
+            page = fetcher.create_page(
+                space_key=space_key,
+                title=f"{name} {marker}",
+                body=f"{marker} {name}",
+                parent_id=ids[parent] if parent else None,
+            )
+            ids[name] = page.id
+            created.append(page.id)
+
+        try:
+            make("R", space)
+            make("A", space, "R")
+            make("A1", space, "A")
+            make("B", space, "R")
+            make("U", space)
+            if space2:
+                make("X", space2)
+
+            # Wait for the index to see every page before any filtered query,
+            # so exclusion assertions below are not satisfied by index lag.
+            cql = f'title ~ "{marker}"'
+            found = _retry_until(
+                lambda: {p.id for p in fetcher.search(cql, limit=50)},
+                lambda got: set(ids.values()) <= got,
+                tries=30,
+            )
+            if not set(ids.values()) <= found:
+                pytest.skip("Search index did not catch up with the test pages")
+            yield ids
+        finally:
+            for page_id in reversed(created):  # children before parents
+                try:
+                    fetcher.delete_page(page_id=page_id)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    @pytest.fixture
+    def search(self, base_config, marker):
+        """Return search(names, cql=None, **filters) -> set of page ids."""
+
+        def _search(
+            cql: str | None = None, spaces_filter: str | None = None, **filters
+        ) -> set[str]:
+            config = dataclasses.replace(base_config, **filters)
+            fetcher = ConfluenceFetcher(config=config)
+            query = cql or f'title ~ "{marker}"'
+            results = fetcher.search(query, limit=50, spaces_filter=spaces_filter)
+            return {p.id for p in results}
+
+        return _search
+
+    @staticmethod
+    def _expect(tree: dict[str, str], *names: str) -> set[str]:
+        return {tree[n] for n in names}
+
+    def test_unfiltered_baseline(self, tree, search):
+        names = ["R", "A", "A1", "B", "U"] + (["X"] if "X" in tree else [])
+        assert search() == self._expect(tree, *names)
+
+    def test_pages_filter_matches_only_exact_page(self, tree, search):
+        """PAGES=A returns A but not its child A1 or its parent R."""
+        assert search(pages_filter=tree["A"]) == self._expect(tree, "A")
+
+    def test_trees_filter_includes_root_and_all_descendants(self, tree, search):
+        """TREES=R reaches grandchildren (ancestor) and excludes outsiders."""
+        assert search(trees_filter=tree["R"]) == self._expect(tree, "R", "A", "A1", "B")
+
+    def test_trees_filter_on_subtree(self, tree, search):
+        assert search(trees_filter=tree["A"]) == self._expect(tree, "A", "A1")
+
+    def test_pages_and_trees_are_unioned(self, tree, search):
+        assert search(pages_filter=tree["B"], trees_filter=tree["A"]) == self._expect(
+            tree, "A", "A1", "B"
+        )
+
+    def test_spaces_and_trees_are_unioned(self, tree, search, space):
+        """SPACES covers U and the tree; TREES adds nothing new in the same space."""
+        assert search(spaces_filter=space, trees_filter=tree["A"]) == self._expect(
+            tree, "R", "A", "A1", "B", "U"
+        )
+
+    def test_spaces_plus_page_in_other_space_is_unioned(self, tree, search, space):
+        """The headline case: a whole space, plus one page from elsewhere."""
+        if "X" not in tree:
+            pytest.skip("CONFLUENCE_TEST_SPACE_KEY_2 not set")
+        assert search(spaces_filter=space) == self._expect(
+            tree, "R", "A", "A1", "B", "U"
+        )
+        assert search(spaces_filter=space, pages_filter=tree["X"]) == self._expect(
+            tree, "R", "A", "A1", "B", "U", "X"
+        )
+
+    def test_spaces_filter_arg_narrows_scope(self, tree, search, space):
+        """The tool arg intersects with the configured scope, never widens it."""
+        assert search(trees_filter=tree["R"], spaces_filter=space) == self._expect(
+            tree, "R", "A", "A1", "B"
+        )
+
+    def test_spaces_filter_arg_cannot_widen_to_other_space(self, tree, search, space2):
+        if not space2:
+            pytest.skip("CONFLUENCE_TEST_SPACE_KEY_2 not set")
+        assert search(trees_filter=tree["R"], spaces_filter=space2) == set()
+
+    @pytest.mark.security_regression
+    def test_caller_cql_cannot_escape_pages_scope(self, tree, search, marker):
+        """Asking for a page outside the configured scope returns nothing."""
+        cql = f'title ~ "{marker}" AND id = {tree["A"]}'
+        assert search(cql=cql, pages_filter=tree["U"]) == set()
+
+    @pytest.mark.security_regression
+    def test_caller_cql_cannot_escape_trees_scope(self, tree, search, marker):
+        """An OR in the caller's CQL cannot widen past the tree."""
+        cql = f'title ~ "{marker}" OR id = {tree["U"]}'
+        assert search(cql=cql, trees_filter=tree["A"]) <= self._expect(tree, "A", "A1")
+
+    def test_order_by_survives_scoping(self, tree, search, marker):
+        """A trailing ORDER BY stays valid CQL once the scope is ANDed in."""
+        cql = f'title ~ "{marker}" ORDER BY title ASC'
+        assert search(cql=cql, trees_filter=tree["R"]) == self._expect(
+            tree, "R", "A", "A1", "B"
+        )
 
 
 @pytest.mark.integration
